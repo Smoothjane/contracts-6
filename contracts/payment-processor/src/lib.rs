@@ -1,317 +1,425 @@
+//! Payment processor.
+//!
+//! Settles a point-of-sale payment in a single atomic transaction:
+//!
+//! 1. Checks the merchant is active in the merchant registry and accepts
+//!    the asset being paid.
+//! 2. Rejects a second payment for the same `(merchant, order_ref)` so a
+//!    double-tapped "Pay" button can never charge a customer twice.
+//! 3. Moves the protocol fee to the treasury and the net amount to the
+//!    merchant's settlement account, straight from the payer. The contract
+//!    never holds customer funds.
+//! 4. Optionally accrues loyalty points for the payer.
+//!
+//! Refunds are pushed by the merchant's settlement account (which received
+//! the funds) back to the original payer, up to the gross amount paid.
+
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec, log};
-use soroban_token_sdk::{TokenClient, TokenUtils};
-use shared::{errors::ContractError, types::PaymentStatus};
+use shared::{extend_instance, extend_persistent, split_fee, MAX_FEE_BPS};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
+    Address, Env, String,
+};
 
-// Contract storage keys
-#[contracttype]
-pub enum DataKey {
-    Admin,
-    FeeRate,
-    PaymentCounter,
-    Payment(u64),
-    MerchantFees(Address),
+pub const MAX_ORDER_REF_LEN: u32 = 64;
+
+/// The subset of the merchant registry this contract calls.
+#[allow(dead_code)]
+#[contractclient(name = "RegistryClient")]
+pub trait RegistryInterface {
+    fn accepts(env: Env, owner: Address, asset: Address) -> bool;
+    fn settlement_of(env: Env, owner: Address) -> Address;
 }
 
-// Payment data structure
+/// The subset of the loyalty program this contract calls.
+#[allow(dead_code)]
+#[contractclient(name = "LoyaltyClient")]
+pub trait LoyaltyInterface {
+    fn accrue(env: Env, caller: Address, merchant: Address, customer: Address, amount: i128)
+        -> u64;
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum PaymentError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Paused = 3,
+    InvalidAmount = 4,
+    InvalidFeeRate = 5,
+    MerchantNotAccepting = 6,
+    DuplicateOrder = 7,
+    InvalidOrderRef = 8,
+    PaymentNotFound = 9,
+    RefundExceedsPayment = 10,
+    AlreadyRefunded = 11,
+    Overflow = 12,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PaymentStatus {
+    Completed,
+    PartiallyRefunded,
+    Refunded,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Payment {
     pub id: u64,
     pub payer: Address,
     pub merchant: Address,
-    pub amount: i128,
+    pub settlement: Address,
     pub asset: Address,
+    /// Gross amount the payer authorized.
+    pub amount: i128,
     pub fee: i128,
+    pub refunded: i128,
+    pub order_ref: String,
+    pub loyalty_points: u64,
     pub status: PaymentStatus,
-    pub memo: String,
-    pub timestamp: u64,
-    pub refund_amount: i128,
+    pub created_at: u64,
 }
 
-// Contract events
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaymentCreatedEvent {
+pub struct Config {
+    pub admin: Address,
+    pub registry: Address,
+    pub treasury: Address,
+    pub fee_bps: u32,
+    pub loyalty: Option<Address>,
+    pub paused: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+enum DataKey {
+    Config,
+    PaymentCount,
+    Payment(u64),
+    Order(Address, String),
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentSettled {
+    #[topic]
+    pub merchant: Address,
+    #[topic]
     pub payment_id: u64,
     pub payer: Address,
-    pub merchant: Address,
-    pub amount: i128,
     pub asset: Address,
+    pub amount: i128,
+    pub fee: i128,
+    pub order_ref: String,
 }
 
-#[contracttype]
+#[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RefundProcessedEvent {
+pub struct PaymentRefunded {
+    #[topic]
+    pub merchant: Address,
+    #[topic]
     pub payment_id: u64,
-    pub refund_amount: i128,
+    pub amount: i128,
+    pub total_refunded: i128,
     pub reason: String,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigUpdated {
+    pub fee_bps: u32,
+    pub treasury: Address,
+    pub paused: bool,
+}
+
 #[contract]
-pub struct PaymentProcessorContract;
+pub struct PaymentProcessor;
 
 #[contractimpl]
-impl PaymentProcessorContract {
-    /// Initialize the payment processor contract
-    pub fn initialize(env: Env, admin: Address, fee_rate: u32) -> Result<(), ContractError> {
-        if env.storage().instance().has(&DataKey::Admin) {
-            return Err(ContractError::AlreadyInitialized);
+impl PaymentProcessor {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        registry: Address,
+        treasury: Address,
+        fee_bps: u32,
+    ) -> Result<(), PaymentError> {
+        if env.storage().instance().has(&DataKey::Config) {
+            return Err(PaymentError::AlreadyInitialized);
         }
-
-        // Validate fee rate (max 10% = 1000 basis points)
-        if fee_rate > 1000 {
-            return Err(ContractError::InvalidFeeRate);
+        admin.require_auth();
+        if fee_bps > MAX_FEE_BPS {
+            return Err(PaymentError::InvalidFeeRate);
         }
-
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::FeeRate, &fee_rate);
-        env.storage().instance().set(&DataKey::PaymentCounter, &0u64);
-
-        log!(&env, "PaymentProcessor initialized with admin: {:?}, fee_rate: {}", admin, fee_rate);
-        
+        let config = Config {
+            admin,
+            registry,
+            treasury,
+            fee_bps,
+            loyalty: None,
+            paused: false,
+        };
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().set(&DataKey::PaymentCount, &0u64);
+        extend_instance(&env);
         Ok(())
     }
 
-    /// Process a payment transaction
-    pub fn process_payment(
+    /// Settles a sale. `order_ref` is the POS order number; it must be unique
+    /// per merchant.
+    pub fn pay(
         env: Env,
         payer: Address,
         merchant: Address,
-        amount: i128,
         asset: Address,
-        memo: String,
-    ) -> Result<u64, ContractError> {
+        amount: i128,
+        order_ref: String,
+    ) -> Result<u64, PaymentError> {
+        let config = Self::config(&env)?;
+        if config.paused {
+            return Err(PaymentError::Paused);
+        }
         payer.require_auth();
 
         if amount <= 0 {
-            return Err(ContractError::InvalidAmount);
+            return Err(PaymentError::InvalidAmount);
+        }
+        if order_ref.is_empty() || order_ref.len() > MAX_ORDER_REF_LEN {
+            return Err(PaymentError::InvalidOrderRef);
+        }
+        let order_key = DataKey::Order(merchant.clone(), order_ref.clone());
+        if env.storage().persistent().has(&order_key) {
+            return Err(PaymentError::DuplicateOrder);
         }
 
-        // Get next payment ID
-        let payment_counter: u64 = env.storage().instance().get(&DataKey::PaymentCounter).unwrap_or(0);
-        let payment_id = payment_counter + 1;
+        let registry = RegistryClient::new(&env, &config.registry);
+        if !registry.accepts(&merchant, &asset) {
+            return Err(PaymentError::MerchantNotAccepting);
+        }
+        let settlement = registry.settlement_of(&merchant);
 
-        // Calculate fee
-        let fee_rate: u32 = env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0);
-        let fee = (amount * fee_rate as i128) / 10000; // fee_rate in basis points
-        let net_amount = amount - fee;
-
-        // Create token client
-        let token = TokenClient::new(&env, &asset);
-
-        // Transfer payment amount from payer to merchant
-        token.transfer(&payer, &merchant, &net_amount);
-
-        // Transfer fee to admin if fee > 0
+        let (fee, net) = split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
+        let token = token::Client::new(&env, &asset);
+        token.transfer(&payer, &settlement, &net);
         if fee > 0 {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-            token.transfer(&payer, &admin, &fee);
+            token.transfer(&payer, &config.treasury, &fee);
         }
 
-        // Create payment record
-        let payment = Payment {
-            id: payment_id,
-            payer: payer.clone(),
-            merchant: merchant.clone(),
-            amount,
-            asset: asset.clone(),
-            fee,
-            status: PaymentStatus::Completed,
-            memo: memo.clone(),
-            timestamp: env.ledger().timestamp(),
-            refund_amount: 0,
+        let loyalty_points = match &config.loyalty {
+            Some(loyalty) => LoyaltyClient::new(&env, loyalty).accrue(
+                &env.current_contract_address(),
+                &merchant,
+                &payer,
+                &amount,
+            ),
+            None => 0,
         };
 
-        // Store payment
-        env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
-        env.storage().instance().set(&DataKey::PaymentCounter, &payment_id);
+        let id = Self::payment_count(env.clone()) + 1;
+        let payment = Payment {
+            id,
+            payer: payer.clone(),
+            merchant: merchant.clone(),
+            settlement,
+            asset: asset.clone(),
+            amount,
+            fee,
+            refunded: 0,
+            order_ref: order_ref.clone(),
+            loyalty_points,
+            status: PaymentStatus::Completed,
+            created_at: env.ledger().timestamp(),
+        };
+        Self::save(&env, &payment);
+        env.storage().persistent().set(&order_key, &id);
+        extend_persistent(&env, &order_key);
+        env.storage().instance().set(&DataKey::PaymentCount, &id);
+        extend_instance(&env);
 
-        // Emit event
-        env.events().publish(
-            ("payment_created", payment_id),
-            PaymentCreatedEvent {
-                payment_id,
-                payer: payer.clone(),
-                merchant: merchant.clone(),
-                amount,
-                asset,
-            },
-        );
-
-        log!(&env, "Payment processed: ID {}, Amount: {}, Fee: {}", payment_id, amount, fee);
-
-        Ok(payment_id)
+        PaymentSettled {
+            merchant,
+            payment_id: id,
+            payer,
+            asset,
+            amount,
+            fee,
+            order_ref,
+        }
+        .publish(&env);
+        Ok(id)
     }
 
-    /// Get payment details
-    pub fn get_payment(env: Env, payment_id: u64) -> Result<Payment, ContractError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Payment(payment_id))
-            .ok_or(ContractError::PaymentNotFound)
-    }
-
-    /// Verify payment status
-    pub fn verify_payment(env: Env, payment_id: u64) -> Result<PaymentStatus, ContractError> {
-        let payment: Payment = Self::get_payment(env, payment_id)?;
-        Ok(payment.status)
-    }
-
-    /// Process refund (admin only)
-    pub fn process_refund(
+    /// Refunds part or all of a payment from the merchant's settlement
+    /// account back to the payer. The protocol fee is not returned by the
+    /// treasury, so the merchant absorbs it on refunds.
+    pub fn refund(
         env: Env,
         payment_id: u64,
-        refund_amount: i128,
+        amount: i128,
         reason: String,
-    ) -> Result<u64, ContractError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
+    ) -> Result<i128, PaymentError> {
+        let mut payment = Self::load(&env, payment_id)?;
+        payment.settlement.require_auth();
 
-        if refund_amount <= 0 {
-            return Err(ContractError::InvalidAmount);
+        if amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        if payment.status == PaymentStatus::Refunded {
+            return Err(PaymentError::AlreadyRefunded);
+        }
+        let total = payment
+            .refunded
+            .checked_add(amount)
+            .ok_or(PaymentError::Overflow)?;
+        if total > payment.amount {
+            return Err(PaymentError::RefundExceedsPayment);
         }
 
-        let mut payment: Payment = Self::get_payment(env.clone(), payment_id)?;
-        
-        if payment.status != PaymentStatus::Completed {
-            return Err(ContractError::PaymentNotCompleted);
-        }
-
-        let total_refunded = payment.refund_amount + refund_amount;
-        if total_refunded > payment.amount {
-            return Err(ContractError::RefundExceedsPayment);
-        }
-
-        // Process refund transfer
-        let token = TokenClient::new(&env, &payment.asset);
-        token.transfer(&payment.merchant, &payment.payer, &refund_amount);
-
-        // Update payment record
-        payment.refund_amount = total_refunded;
-        if total_refunded == payment.amount {
-            payment.status = PaymentStatus::FullyRefunded;
-        } else {
-            payment.status = PaymentStatus::PartiallyRefunded;
-        }
-
-        env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
-
-        // Emit refund event
-        env.events().publish(
-            ("refund_processed", payment_id),
-            RefundProcessedEvent {
-                payment_id,
-                refund_amount,
-                reason,
-            },
+        token::Client::new(&env, &payment.asset).transfer(
+            &payment.settlement,
+            &payment.payer,
+            &amount,
         );
 
-        log!(&env, "Refund processed: Payment {}, Amount: {}", payment_id, refund_amount);
+        payment.refunded = total;
+        payment.status = if total == payment.amount {
+            PaymentStatus::Refunded
+        } else {
+            PaymentStatus::PartiallyRefunded
+        };
+        Self::save(&env, &payment);
 
-        Ok(payment_id)
+        PaymentRefunded {
+            merchant: payment.merchant,
+            payment_id,
+            amount,
+            total_refunded: total,
+            reason,
+        }
+        .publish(&env);
+        Ok(total)
     }
 
-    /// Update fee rate (admin only)
-    pub fn update_fee_rate(env: Env, new_fee_rate: u32) -> Result<(), ContractError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
+    // ---------------------------------------------------------------------
+    // Admin
+    // ---------------------------------------------------------------------
 
-        if new_fee_rate > 1000 {
-            return Err(ContractError::InvalidFeeRate);
+    pub fn set_fee_bps(env: Env, fee_bps: u32) -> Result<(), PaymentError> {
+        if fee_bps > MAX_FEE_BPS {
+            return Err(PaymentError::InvalidFeeRate);
         }
+        Self::update(&env, |c| c.fee_bps = fee_bps)
+    }
 
-        env.storage().instance().set(&DataKey::FeeRate, &new_fee_rate);
-        
-        log!(&env, "Fee rate updated to: {}", new_fee_rate);
-        
+    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PaymentError> {
+        Self::update(&env, |c| c.treasury = treasury)
+    }
+
+    /// Enables loyalty accrual through the given loyalty program contract.
+    /// Pass `None` to switch accrual off.
+    pub fn set_loyalty(env: Env, loyalty: Option<Address>) -> Result<(), PaymentError> {
+        Self::update(&env, |c| c.loyalty = loyalty)
+    }
+
+    pub fn pause(env: Env) -> Result<(), PaymentError> {
+        Self::update(&env, |c| c.paused = true)
+    }
+
+    pub fn unpause(env: Env) -> Result<(), PaymentError> {
+        Self::update(&env, |c| c.paused = false)
+    }
+
+    // ---------------------------------------------------------------------
+    // Views
+    // ---------------------------------------------------------------------
+
+    pub fn get_payment(env: Env, payment_id: u64) -> Result<Payment, PaymentError> {
+        Self::load(&env, payment_id)
+    }
+
+    /// Looks up a payment by the POS order reference. The backend uses this
+    /// to confirm an order was paid on-chain.
+    pub fn payment_for_order(
+        env: Env,
+        merchant: Address,
+        order_ref: String,
+    ) -> Result<Payment, PaymentError> {
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Order(merchant, order_ref))
+            .ok_or(PaymentError::PaymentNotFound)?;
+        Self::load(&env, id)
+    }
+
+    pub fn payment_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentCount)
+            .unwrap_or(0)
+    }
+
+    pub fn get_config(env: Env) -> Result<Config, PaymentError> {
+        Self::config(&env)
+    }
+
+    /// Fee and net split for a prospective payment, for checkout previews.
+    pub fn quote(env: Env, amount: i128) -> Result<(i128, i128), PaymentError> {
+        if amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        split_fee(amount, Self::config(&env)?.fee_bps).ok_or(PaymentError::Overflow)
+    }
+
+    // ---------------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------------
+
+    fn config(env: &Env) -> Result<Config, PaymentError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(PaymentError::NotInitialized)
+    }
+
+    fn update(env: &Env, f: impl FnOnce(&mut Config)) -> Result<(), PaymentError> {
+        let mut config = Self::config(env)?;
+        config.admin.require_auth();
+        f(&mut config);
+        env.storage().instance().set(&DataKey::Config, &config);
+        extend_instance(env);
+        ConfigUpdated {
+            fee_bps: config.fee_bps,
+            treasury: config.treasury,
+            paused: config.paused,
+        }
+        .publish(env);
         Ok(())
     }
 
-    /// Get current fee rate
-    pub fn get_fee_rate(env: Env) -> u32 {
-        env.storage().instance().get(&DataKey::FeeRate).unwrap_or(0)
+    fn load(env: &Env, id: u64) -> Result<Payment, PaymentError> {
+        let key = DataKey::Payment(id);
+        let payment = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(PaymentError::PaymentNotFound)?;
+        extend_persistent(env, &key);
+        Ok(payment)
     }
 
-    /// Get total payments processed
-    pub fn get_payment_count(env: Env) -> u64 {
-        env.storage().instance().get(&DataKey::PaymentCounter).unwrap_or(0)
-    }
-
-    /// Get contract admin
-    pub fn get_admin(env: Env) -> Result<Address, ContractError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(ContractError::NotInitialized)
+    fn save(env: &Env, payment: &Payment) {
+        let key = DataKey::Payment(payment.id);
+        env.storage().persistent().set(&key, payment);
+        extend_persistent(env, &key);
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env};
-
-    #[test]
-    fn test_initialize() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let fee_rate = 250; // 2.5%
-
-        let result = PaymentProcessorContract::initialize(env.clone(), admin.clone(), fee_rate);
-        assert!(result.is_ok());
-
-        assert_eq!(PaymentProcessorContract::get_admin(env.clone()).unwrap(), admin);
-        assert_eq!(PaymentProcessorContract::get_fee_rate(env), fee_rate);
-    }
-
-    #[test]
-    fn test_process_payment() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let admin = Address::generate(&env);
-        let payer = Address::generate(&env);
-        let merchant = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        
-        // Initialize contract
-        PaymentProcessorContract::initialize(env.clone(), admin, 250).unwrap();
-
-        // Create and mint token
-        let token_id = env.register_stellar_asset_contract(token_admin);
-        let token = TokenClient::new(&env, &token_id);
-        token.mint(&payer, &1000);
-
-        // Process payment
-        let payment_id = PaymentProcessorContract::process_payment(
-            env.clone(),
-            payer.clone(),
-            merchant.clone(),
-            100,
-            token_id.clone(),
-            String::from_str(&env, "Test payment"),
-        ).unwrap();
-
-        assert_eq!(payment_id, 1);
-
-        // Verify payment
-        let payment = PaymentProcessorContract::get_payment(env.clone(), payment_id).unwrap();
-        assert_eq!(payment.payer, payer);
-        assert_eq!(payment.merchant, merchant);
-        assert_eq!(payment.amount, 100);
-        assert_eq!(payment.status, PaymentStatus::Completed);
-    }
-}// Payment processor update 1
-// Payment processor update 7
-// Payment processor update 13
-// Payment processor update 19
-// Payment processor update 25
-// Payment processor update 31
-// Payment processor update 37
-// Payment processor update 43
-// Payment processor update 49
-// Payment processor update 55
-// Payment processor update 61
-// Payment processor update 67
+mod test;
