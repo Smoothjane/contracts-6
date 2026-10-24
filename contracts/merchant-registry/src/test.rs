@@ -247,3 +247,32 @@ fn active_merchants_cannot_be_rejected() {
         Err(Ok(RegistryError::InvalidStatusTransition))
     );
 }
+
+#[test]
+fn checkout_target_returns_settlement_only_when_payable() {
+    let s = setup();
+    register(&s);
+    // Pending: not payable yet.
+    assert_eq!(s.client.checkout_target(&s.owner, &s.usdc), None);
+
+    s.client.approve(&s.owner);
+    assert_eq!(
+        s.client.checkout_target(&s.owner, &s.usdc),
+        Some(s.settlement.clone())
+    );
+    // Asset not on the merchant's list.
+    assert_eq!(
+        s.client
+            .checkout_target(&s.owner, &Address::generate(&s.env)),
+        None
+    );
+    // Unknown merchant.
+    assert_eq!(
+        s.client
+            .checkout_target(&Address::generate(&s.env), &s.usdc),
+        None
+    );
+
+    s.client.suspend(&s.owner);
+    assert_eq!(s.client.checkout_target(&s.owner, &s.usdc), None);
+}
