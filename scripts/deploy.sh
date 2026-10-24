@@ -35,7 +35,9 @@ fi
 ADMIN="$(stellar keys address "$SOURCE")"
 echo "Admin: $ADMIN"
 
-[[ -d "$WASM_DIR" ]] || stellar contract build
+# Always rebuild: deploying a stale wasm from an earlier build would put
+# different code on-chain than this checkout.
+stellar contract build >/dev/null 2>&1
 
 deploy() {
   stellar contract deploy \
@@ -65,7 +67,8 @@ invoke "$ESCROW"    initialize --admin "$ADMIN"
 
 echo "Wiring loyalty accrual into the payment processor"
 invoke "$LOYALTY"   set_processor --processor "$PROCESSOR"
-invoke "$PROCESSOR" set_loyalty --loyalty "$LOYALTY"
+# Option<Address> arguments are JSON, so the ID needs quotes.
+invoke "$PROCESSOR" set_loyalty --loyalty "\"$LOYALTY\""
 
 mkdir -p deployments
 cat > "$OUT" <<JSON

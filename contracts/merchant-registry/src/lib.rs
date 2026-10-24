@@ -98,6 +98,12 @@ pub struct PauseToggled {
     pub paused: bool,
 }
 
+// Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
+// deployed contract back to its source; see scripts/verify.sh.
+soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
+soroban_sdk::contractmeta!(key = "home_domain", val = "github.com/StellarPOS-App");
+soroban_sdk::contractmeta!(key = "desc", val = "StellarPOS merchant registry");
+
 #[contract]
 pub struct MerchantRegistry;
 

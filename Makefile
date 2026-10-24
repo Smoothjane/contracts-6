@@ -4,12 +4,13 @@
 #   make test       run the full test suite
 #   make check      fmt + clippy + test, exactly what CI runs
 #   make deploy     deploy and wire all contracts (NETWORK=testnet by default)
+#   make verify     check deployed contracts match this source (NETWORK=testnet)
 
 NETWORK ?= testnet
 SOURCE  ?= stellarpos-deployer
 FEE_BPS ?= 100
 
-.PHONY: all build test fmt fmt-check lint check clean deploy sizes help
+.PHONY: all build test fmt fmt-check lint check clean deploy verify sizes help
 
 all: build
 
@@ -38,6 +39,9 @@ sizes: build
 
 deploy: build
 	NETWORK=$(NETWORK) SOURCE=$(SOURCE) FEE_BPS=$(FEE_BPS) ./scripts/deploy.sh
+
+verify:
+	NETWORK=$(NETWORK) ./scripts/verify.sh
 
 clean:
 	cargo clean
