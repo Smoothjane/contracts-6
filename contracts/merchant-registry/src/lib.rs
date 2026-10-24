@@ -322,6 +322,16 @@ impl MerchantRegistry {
         }
     }
 
+    /// Everything checkout needs in one call: the settlement account if the
+    /// merchant is active and accepts `asset`, otherwise `None`. Replaces an
+    /// `accepts` + `settlement_of` pair, halving cross-contract calls and
+    /// merchant reads per payment.
+    pub fn checkout_target(env: Env, owner: Address, asset: Address) -> Option<Address> {
+        let merchant = Self::load(&env, &owner).ok()?;
+        (merchant.status == MerchantStatus::Active && merchant.accepted_assets.contains(&asset))
+            .then_some(merchant.settlement)
+    }
+
     /// Settlement account for an active merchant.
     pub fn settlement_of(env: Env, owner: Address) -> Result<Address, RegistryError> {
         let merchant = Self::load(&env, &owner)?;

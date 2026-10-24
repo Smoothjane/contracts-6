@@ -28,8 +28,7 @@ pub const MAX_ORDER_REF_LEN: u32 = 64;
 #[allow(dead_code)]
 #[contractclient(name = "RegistryClient")]
 pub trait RegistryInterface {
-    fn accepts(env: Env, owner: Address, asset: Address) -> bool;
-    fn settlement_of(env: Env, owner: Address) -> Address;
+    fn checkout_target(env: Env, owner: Address, asset: Address) -> Option<Address>;
 }
 
 /// The subset of the loyalty program this contract calls.
@@ -204,11 +203,10 @@ impl PaymentProcessor {
             return Err(PaymentError::DuplicateOrder);
         }
 
-        let registry = RegistryClient::new(&env, &config.registry);
-        if !registry.accepts(&merchant, &asset) {
-            return Err(PaymentError::MerchantNotAccepting);
-        }
-        let settlement = registry.settlement_of(&merchant);
+        // One cross-contract call: active + accepts the asset + where to pay.
+        let settlement = RegistryClient::new(&env, &config.registry)
+            .checkout_target(&merchant, &asset)
+            .ok_or(PaymentError::MerchantNotAccepting)?;
 
         let (fee, net) = split_fee(amount, config.fee_bps).ok_or(PaymentError::Overflow)?;
         let token = token::Client::new(&env, &asset);
