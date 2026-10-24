@@ -18,6 +18,8 @@ use soroban_sdk::{
 /// Maximum number of assets a merchant can accept. Keeps `accepts` cheap.
 pub const MAX_ACCEPTED_ASSETS: u32 = 10;
 pub const MAX_NAME_LEN: u32 = 64;
+/// Cap on merchants per approve_many call, to stay well inside resource limits.
+pub const MAX_BATCH: u32 = 25;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -32,6 +34,7 @@ pub enum RegistryError {
     TooManyAssets = 7,
     DuplicateAsset = 8,
     InvalidStatusTransition = 9,
+    BatchTooLarge = 10,
 }
 
 #[contracttype]
@@ -90,6 +93,13 @@ pub struct MerchantUpdated {
     pub owner: Address,
     pub settlement: Address,
     pub accepted_assets: Vec<Address>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRejected {
+    #[topic]
+    pub owner: Address,
 }
 
 #[contractevent]
@@ -207,6 +217,51 @@ impl MerchantRegistry {
 
     pub fn approve(env: Env, owner: Address) -> Result<(), RegistryError> {
         Self::set_status(&env, owner, MerchantStatus::Pending, MerchantStatus::Active)
+    }
+
+    /// Approves a batch of pending merchants in one transaction, e.g. after a
+    /// review session. Owners that are unknown or not pending are skipped,
+    /// so one stale entry does not block the rest. Returns how many were
+    /// approved.
+    pub fn approve_many(env: Env, owners: Vec<Address>) -> Result<u32, RegistryError> {
+        if owners.len() > MAX_BATCH {
+            return Err(RegistryError::BatchTooLarge);
+        }
+        Self::admin(&env)?.require_auth();
+        let mut approved = 0;
+        for owner in owners.iter() {
+            if Self::apply_status(&env, owner, MerchantStatus::Pending, MerchantStatus::Active)
+                .is_ok()
+            {
+                approved += 1;
+            }
+        }
+        Ok(approved)
+    }
+
+    /// Declines a pending registration and deletes it, so the applicant can
+    /// fix their details and register again. Active or suspended merchants
+    /// cannot be rejected; suspend them instead, which keeps their history.
+    pub fn reject(env: Env, owner: Address) -> Result<(), RegistryError> {
+        Self::admin(&env)?.require_auth();
+        let merchant = Self::load(&env, &owner)?;
+        if merchant.status != MerchantStatus::Pending {
+            return Err(RegistryError::InvalidStatusTransition);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Merchant(owner.clone()));
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantCount)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantCount, &count.saturating_sub(1));
+        extend_instance(&env);
+        MerchantRejected { owner }.publish(&env);
+        Ok(())
     }
 
     pub fn suspend(env: Env, owner: Address) -> Result<(), RegistryError> {
@@ -327,6 +382,17 @@ impl MerchantRegistry {
         to: MerchantStatus,
     ) -> Result<(), RegistryError> {
         Self::admin(env)?.require_auth();
+        Self::apply_status(env, owner, from, to)
+    }
+
+    /// Status change without the auth check, for callers that already
+    /// authorized the admin once (batch operations).
+    fn apply_status(
+        env: &Env,
+        owner: Address,
+        from: MerchantStatus,
+        to: MerchantStatus,
+    ) -> Result<(), RegistryError> {
         let mut merchant = Self::load(env, &owner)?;
         if merchant.status != from {
             return Err(RegistryError::InvalidStatusTransition);
