@@ -181,3 +181,69 @@ fn initialize_twice_fails() {
         Err(Ok(RegistryError::AlreadyInitialized))
     );
 }
+
+#[test]
+fn approve_many_approves_pending_and_skips_the_rest() {
+    let s = setup();
+    let mut pending = vec![&s.env];
+    for i in 0..3 {
+        let owner = Address::generate(&s.env);
+        s.client.register(
+            &owner,
+            &String::from_str(&s.env, if i == 0 { "A" } else { "B" }),
+            &s.settlement,
+            &vec![&s.env, s.usdc.clone()],
+        );
+        pending.push_back(owner);
+    }
+    register(&s);
+    s.client.approve(&s.owner);
+
+    // Already-active and unknown owners are skipped, not fatal.
+    let mut batch = pending.clone();
+    batch.push_back(s.owner.clone());
+    batch.push_back(Address::generate(&s.env));
+    assert_eq!(s.client.approve_many(&batch), 3);
+    for owner in pending.iter() {
+        assert!(s.client.is_active(&owner));
+    }
+}
+
+#[test]
+fn approve_many_is_capped() {
+    let s = setup();
+    let mut batch = vec![&s.env];
+    for _ in 0..=MAX_BATCH {
+        batch.push_back(Address::generate(&s.env));
+    }
+    assert_eq!(
+        s.client.try_approve_many(&batch),
+        Err(Ok(RegistryError::BatchTooLarge))
+    );
+}
+
+#[test]
+fn reject_removes_a_pending_registration_so_it_can_reapply() {
+    let s = setup();
+    register(&s);
+    s.client.reject(&s.owner);
+    assert_eq!(
+        s.client.try_get_merchant(&s.owner),
+        Err(Ok(RegistryError::MerchantNotFound))
+    );
+    assert_eq!(s.client.merchant_count(), 0);
+
+    register(&s);
+    assert_eq!(s.client.merchant_count(), 1);
+}
+
+#[test]
+fn active_merchants_cannot_be_rejected() {
+    let s = setup();
+    register(&s);
+    s.client.approve(&s.owner);
+    assert_eq!(
+        s.client.try_reject(&s.owner),
+        Err(Ok(RegistryError::InvalidStatusTransition))
+    );
+}
