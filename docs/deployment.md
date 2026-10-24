@@ -19,6 +19,24 @@ This runs [`scripts/deploy.sh`](../scripts/deploy.sh), which:
 Mainnet deploys need `CONFIRM_MAINNET=yes` and an identity you imported
 yourself with `stellar keys add`.
 
+## 1b. Verify what is on-chain
+
+```bash
+make verify NETWORK=testnet
+```
+
+[`scripts/verify.sh`](../scripts/verify.sh) rebuilds every contract from
+this checkout, downloads the wasm each contract ID in
+`deployments/<network>.json` is running, and compares SHA-256 hashes. It
+exits non-zero if anything differs. Each contract also embeds SEP-0055
+metadata (`source_repo`, `home_domain`, `desc`) plus the Rust, SDK and CLI
+versions it was built with, readable with
+`stellar contract info meta --wasm <file>` or `--contract-id <id>`.
+
+Anyone can run this against a published manifest to check that a
+deployment runs this source, which is useful before an audit or before
+trusting a mainnet deployment.
+
 ## 2. Harden the treasury
 
 Before the treasury holds real fees, turn the 1-of-1 deployer setup into a

@@ -153,6 +153,12 @@ fn points_for(program: &Program, tier: Tier, amount: i128) -> Option<u64> {
     u64::try_from(boosted).ok()
 }
 
+// Build metadata embedded in the wasm (SEP-0055), so anyone can trace a
+// deployed contract back to its source; see scripts/verify.sh.
+soroban_sdk::contractmeta!(key = "source_repo", val = "github:StellarPOS-App/contracts");
+soroban_sdk::contractmeta!(key = "home_domain", val = "github.com/StellarPOS-App");
+soroban_sdk::contractmeta!(key = "desc", val = "StellarPOS loyalty program");
+
 #[contract]
 pub struct LoyaltyProgram;
 

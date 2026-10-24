@@ -91,6 +91,7 @@ make test      # 63 tests across all crates
 make check     # rustfmt + clippy -D warnings + tests (what CI runs)
 make build     # optimized wasm in target/wasm32v1-none/release/
 make sizes     # wasm sizes, all well under the 64 KB limit
+make verify    # check a deployment runs exactly this source (NETWORK=testnet)
 ```
 
 ### Deploy to testnet
